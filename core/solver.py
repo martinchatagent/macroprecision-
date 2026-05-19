@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.optimize import minimize
 from .foods import FOODS, sum_macros
 
 # Alle Tages-Templates: Trainingstag + Ruhetag
@@ -103,25 +102,48 @@ def _solve_day(template: dict, target: dict, seed: int = 42) -> dict:
         all_bounds.extend(meal["bounds"])
         meal_splits.append(len(meal["foods"]))
 
-    n = len(all_foods)
+    bounds_arr = np.array(all_bounds, dtype=float)
+    lo, hi = bounds_arr[:, 0], bounds_arr[:, 1]
     M = np.array([[FOODS[f]["n"][i] for f in all_foods] for i in range(1, 4)]) / 100  # (3, n) — carbs/protein/fat
-    T = np.array([target["carbs"], target["protein"], target["fat"]])
+    T = np.array([target["carbs"], target["protein"], target["fat"]], dtype=float)
+    W = np.array([4.0, 4.0, 1.0])
+
+    # Lipschitz constant of gradient → safe fixed step size for FISTA
+    D = W / T**2
+    L = float(2 * 10000 * np.linalg.eigvalsh(M.T @ (D[:, None] * M)).max())
+    step = 1.0 / L
 
     def obj(x):
-        total = M @ x
-        rel = (total - T) / T
-        return np.sum(rel**2 * np.array([4, 4, 1])) * 10000
+        r = M @ x - T
+        return float(np.sum(W * (r / T) ** 2)) * 10000
+
+    def _fista(x0, n_iter=3000):
+        x = x0.copy()
+        y = x.copy()
+        t = 1.0
+        for _ in range(n_iter):
+            g = 2 * 10000 * M.T @ (W * (M @ y - T) / T**2)
+            x_new = np.clip(y - step * g, lo, hi)
+            t_new = (1.0 + np.sqrt(1.0 + 4.0 * t * t)) / 2.0
+            momentum = (t - 1.0) / t_new
+            y = x_new + momentum * (x_new - x)
+            if np.max(np.abs(x_new - x)) < 1e-10:
+                return x_new
+            x, t = x_new, t_new
+        return x
 
     rng = np.random.RandomState(seed)
-    best = None
+    best_x = None
+    best_f = np.inf
     for _ in range(60):
-        x0 = np.array([rng.uniform(a, b) for a, b in all_bounds])
-        r = minimize(obj, x0, bounds=all_bounds, method='SLSQP',
-                     options={'maxiter': 2000, 'ftol': 1e-12})
-        if best is None or r.fun < best.fun:
-            best = r
+        x0 = rng.uniform(lo, hi)
+        x_cand = _fista(x0)
+        f_cand = obj(x_cand)
+        if f_cand < best_f:
+            best_f = f_cand
+            best_x = x_cand
 
-    x = best.x
+    x = best_x
     total_macros = M @ x
     kcal_vec = np.array([FOODS[f]["n"][0] for f in all_foods]) / 100
     total_kcal = kcal_vec @ x
